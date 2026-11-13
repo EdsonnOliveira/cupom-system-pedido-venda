@@ -1,0 +1,74 @@
+name: Cupom publish exe
+on:
+  repository_dispatch:
+    types: [cupom_publish_exe]
+permissions:
+  contents: write
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Merge staging parts and upload release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          VERSION: ${{ github.event.client_payload.version }}
+          ARTIFACT_NAME: ${{ github.event.client_payload.artifact_name }}
+          PART_PATHS_JSON: ${{ toJson(github.event.client_payload.exe_storage_parts) }}
+        run: |
+          node <<'NODE'
+          const parts = JSON.parse(process.env.PART_PATHS_JSON || '[]');
+          if (!parts.length) {
+            throw new Error('exe_storage_parts vazio');
+          }
+          const version = String(process.env.VERSION || '').trim();
+          const artifactName = String(process.env.ARTIFACT_NAME || '').trim();
+          const base = String(process.env.SUPABASE_URL || '').replace(/\/$/, '');
+          const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+          if (!base || !key) {
+            throw new Error('SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY ausente nos secrets do repo');
+          }
+          async function loadPart(path) {
+            const url = base + '/storage/v1/object/app-releases/' + path.replace(/^\/+/, '');
+            const res = await fetch(url, {
+              headers: { Authorization: 'Bearer ' + key, apikey: key },
+            });
+            if (!res.ok) {
+              throw new Error('Storage ' + path + ' HTTP ' + res.status);
+            }
+            return Buffer.from(await res.arrayBuffer());
+          }
+          (async () => {
+            const chunks = [];
+            for (const part of parts) {
+              chunks.push(await loadPart(String(part)));
+            }
+            const merged = Buffer.concat(chunks);
+            const fs = await import('node:fs');
+            const tmp = '/tmp/' + artifactName;
+            fs.writeFileSync(tmp, merged);
+            const tag = 'v' + version;
+            const { execSync } = await import('node:child_process');
+            execSync(
+              'gh release upload ' +
+                tag +
+                ' ' +
+                JSON.stringify(tmp) +
+                ' --clobber --repo ' +
+                process.env.GITHUB_REPOSITORY,
+              {
+                stdio: 'inherit',
+                env: { ...process.env, GH_TOKEN: process.env.GH_TOKEN },
+              },
+            );
+            fs.unlinkSync(tmp);
+            console.log('upload ok', artifactName, merged.length);
+          })().catch((err) => {
+            console.error(err);
+            process.exit(1);
+          });
+          NODE
